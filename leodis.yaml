@@ -1,0 +1,238 @@
+Parameters:
+  TestString:
+    Type: String
+    Default: test9
+Resources:
+  VPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: 10.20.0.0/16
+  IGW:
+    Type: "AWS::EC2::InternetGateway"
+  GatewayAttach:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      InternetGatewayId: !Ref IGW
+      VpcId: !Ref VPC 
+  SubnetPublicA:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs ]
+      CidrBlock: 10.20.0.0/22
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+  SubnetPublicB:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs ]
+      CidrBlock: 10.20.4.0/22
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+  SubnetRouteTableAssociatePublicA:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref RouteTablePublic
+      SubnetId: !Ref SubnetPublicA
+  SubnetRouteTableAssociatePublicB:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref RouteTablePublic
+      SubnetId: !Ref SubnetPublicB
+  RouteTablePublic:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref VPC
+  RouteDefaultPublic:
+    Type: "AWS::EC2::Route"
+    DependsOn: GatewayAttach
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+      RouteTableId: !Ref RouteTablePublic
+  AutoScalingGroup:
+    DependsOn: GatewayAttach
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: true
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      HealthCheckGracePeriod: 300
+      HealthCheckType: ELB
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      MaxSize: 6
+      MinSize: 2
+      VPCZoneIdentifier:
+        - !Ref SubnetPublicA
+        - !Ref SubnetPublicB
+  LaunchConfiguration:
+    Type: "AWS::AutoScaling::LaunchConfiguration"
+    Properties:
+      ImageId: ami-0009a33f033d8b7b6
+      InstanceType: t2.micro
+      KeyName: ThKP
+      SecurityGroups:
+        - !Ref SG
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash
+            yum update -y aws-cfn-bootstrap
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchConfiguration --configsets confwww --region ${AWS::Region}
+            yum -y update
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource LaunchConfiguration --region ${AWS::Region}
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT15M
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          confwww:
+            - "conf"
+            - "www"
+            - "config_app"
+        conf:
+          files:
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.LaunchConfiguration.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchConfiguration --configsets confwww --region ${AWS::Region}
+              mode: 000400
+              owner: root
+              group: root
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                verbose=true
+                interval=5
+              mode: 000400
+              owner: root
+              group: root
+            /var/www/html/index2.html:
+              content: !Ref TestString
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: "true"
+                ensureRunning: "true"
+                files:
+                  - "/etc/cfn/cfn-hup.conf"
+                  - "/etc/cfn/hooks.d/cfn-auto-reloader.conf"
+        www:
+          packages:
+            yum:
+              httpd: [] 
+          services: 
+            sysvinit::
+              httpd:
+                enabled: "true"
+                ensureRunning: "true"
+        config_app:
+          files:
+            /usr/local/apache2/conf/httpd.conf:
+              source: https://s3.eu-west-2.amazonaws.com/leodishttpdconf/httpd.conf
+          files:
+            /usr/local/apache2/conf/extra/httpd-vhosts.conf:
+              source: https://s3.eu-west-2.amazonaws.com/leodishttpdconf/httpd-vhosts.conf
+          files:
+            /usr/local/apache2/conf/extra/leodis.map:
+              source: https://s3.eu-west-2.amazonaws.com/leodishttpdconf/leodis.map
+  ScaleUpPolicy:
+    Type: "AWS::AutoScaling::ScalingPolicy"
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: SimpleScaling
+      Cooldown: 60
+      ScalingAdjustment: 1
+  ScaleDownPolicy:
+    Type: "AWS::AutoScaling::ScalingPolicy"
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: SimpleScaling
+      Cooldown: 60
+      ScalingAdjustment: -1
+  CPUAlarmHigh:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmDescription: Scale-up if CPU > 70% for 5 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: '1'
+      Threshold: 70
+      AlarmActions:
+        - !Ref ScaleUpPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      ComparisonOperator: GreaterThanThreshold
+  CPUAlarmLow:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmDescription: Scale-down if CPU < 50% for 5 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 50
+      AlarmActions:
+        - !Ref ScaleDownPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      ComparisonOperator: LessThanThreshold
+  ApplicationLoadBalancer:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      Subnets: 
+      - !Ref SubnetPublicA
+      - !Ref SubnetPublicB
+  ALBListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+  ALBTargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      HealthCheckIntervalSeconds: 60
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 3
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: !Ref VPC
+  SG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Leodis
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          ToPort: 80
+          FromPort: 80
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          ToPort: 22
+          FromPort: 22
+      SecurityGroupEgress:
+        -
+          CidrIp: 0.0.0.0/0
+          ToPort: -1
+          IpProtocol: -1
+          
